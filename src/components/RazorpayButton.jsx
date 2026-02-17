@@ -1,37 +1,52 @@
-import React, { useState } from 'react';
+import React from 'react';
 
 const RazorpayButton = ({ cart, setCart }) => {
-  const total = cart.reduce((sum, item) => sum + item.price, 0);
-  
-  const handlePayment = () => {
-    alert(`✅ Payment ₹${total} Success!\n90% Doctor | 10% Platform`);
-    setCart([]); // CLEAR CART after payment
+  // ✅ FIXED: Calculate total by multiplying price and quantity
+  const total = cart.reduce((sum, item) => {
+    const price = Number(item.price) || 0;
+    const qty = Number(item.quantity) || 1;
+    return sum + (price * qty);
+  }, 0);
+
+  const removeItem = (id) => {
+    setCart(cart.filter(item => item.id !== id));
   };
 
-  const removeItem = (index) => {
-    const newCart = cart.filter((_, i) => i !== index);
-    setCart(newCart);
+  const handlePayment = () => {
+    alert(`✅ Order Placed! Total Amount: ₹${total}`);
+    setCart([]); // Clear cart after "payment"
   };
 
   return (
-    <div className="cart">
-      <h3>🛒 Cart ({cart.length})</h3>
-      <div style={{maxHeight: '200px', overflowY: 'auto', marginBottom: '1rem'}}>
-        {cart.map((item, index) => (
-          <div key={index} style={{display: 'flex', justifyContent: 'space-between', padding: '0.5rem', borderBottom: '1px solid #eee'}}>
-            <span>{item.name} - ₹{item.price}</span>
-            <button onClick={() => removeItem(index)} style={{background: '#ff4444', color: 'white', border: 'none', padding: '0.3rem 0.8rem', borderRadius: '4px'}}>
-              Remove
-            </button>
+    <div style={{ background: '#ecfdf5', padding: '20px', borderRadius: '12px', border: '2px solid #10b981' }}>
+      <h3 style={{ marginTop: 0 }}>🛒 Your Cart</h3>
+      <div style={{ marginBottom: '15px' }}>
+        {cart.map((item) => (
+          <div key={item.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #d1fae5' }}>
+            <span>
+              <b>{item.name}</b> x {item.quantity}
+            </span>
+            <div>
+              <span style={{ marginRight: '15px', fontWeight: 'bold' }}>₹{item.price * item.quantity}</span>
+              <button 
+                onClick={() => removeItem(item.id)}
+                style={{ background: 'none', border: 'none', color: '#dc2626', cursor: 'pointer', fontSize: '12px' }}
+              >
+                Remove
+              </button>
+            </div>
           </div>
         ))}
       </div>
-      <div style={{fontSize: '1.2rem', fontWeight: 'bold', marginBottom: '1rem'}}>
-        Total: ₹{total}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontSize: '18px', fontWeight: 'bold' }}>Total: ₹{total}</span>
+        <button 
+          onClick={handlePayment}
+          style={{ padding: '10px 20px', background: '#10b981', color: 'white', border: 'none', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}
+        >
+          Pay Now
+        </button>
       </div>
-      <button onClick={handlePayment} className="pay-button">
-        Pay Now with Razorpay
-      </button>
     </div>
   );
 };

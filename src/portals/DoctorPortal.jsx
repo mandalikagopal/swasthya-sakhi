@@ -1,5 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { doc, getDoc, updateDoc, collection, query, where, onSnapshot, setDoc } from 'firebase/firestore';
+import {
+  doc,
+  getDoc,
+  updateDoc,
+  collection,
+  query,
+  where,
+  onSnapshot,
+  setDoc,
+  arrayUnion, increment
+} from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { db, auth } from '../services/firebase';
 import { useNavigate } from 'react-router-dom';
 
@@ -7,23 +18,32 @@ const DoctorPortal = () => {
   const [online, setOnline] = useState(false);
   const [profile, setProfile] = useState({ name: '', phoneNumber: '', licenseNumber: '' });
   const [schedule, setSchedule] = useState({
-    sun: {from: '', to: ''}, mon: {from: '', to: ''}, tue: {from: '', to: ''},
-    wed: {from: '', to: ''}, thu: {from: '', to: ''}, fri: {from: '', to: ''},
-    sat: {from: '', to: ''}
+    sun: { from: '', to: '' }, mon: { from: '', to: '' }, tue: { from: '', to: '' },
+    wed: { from: '', to: '' }, thu: { from: '', to: '' }, fri: { from: '', to: '' },
+    sat: { from: '', to: '' }
   });
+
   const [pendingBookings, setPendingBookings] = useState([]);
+  const [completedBookings, setCompletedBookings] = useState([]);
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [showSchedule, setShowSchedule] = useState(false);
+
   const navigate = useNavigate();
+  const storage = getStorage();
+
 
   useEffect(() => {
     const currentUser = auth.currentUser;
     if (currentUser) {
       loadProfile(currentUser.uid);
       listenToPendingBookings(currentUser.uid);
+      listenToCompletedBookings(currentUser.uid);
     }
   }, []);
 
+  /* ================= PROFILE ================= */
   const loadProfile = async (uid) => {
     try {
       const userRef = doc(db, 'users', uid);
@@ -39,264 +59,277 @@ const DoctorPortal = () => {
         setSchedule(data.schedule || schedule);
       }
       setLoading(false);
-    } catch (err) {
+    } catch {
       setError('Profile load failed');
       setLoading(false);
     }
   };
 
+  /* ================= BOOKINGS ================= */
   const listenToPendingBookings = (doctorId) => {
     const q = query(
       collection(db, 'bookings'),
       where('doctorId', '==', doctorId),
       where('status', 'in', ['pending', 'accepted'])
     );
+
     return onSnapshot(q, snap => {
-      const bookings = [];
-      snap.forEach(doc => bookings.push({ id: doc.id, ...doc.data() }));
-      setPendingBookings(bookings);
+      const list = [];
+      snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+      setPendingBookings(list);
     });
   };
 
+  const listenToCompletedBookings = (doctorId) => {
+    const q = query(
+      collection(db, 'bookings'),
+      where('doctorId', '==', doctorId),
+      where('status', '==', 'completed')
+    );
+
+    return onSnapshot(q, snap => {
+      const list = [];
+      snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+      setCompletedBookings(list);
+    });
+  };
+
+  /* ================= ACTIONS ================= */
   const toggleOnline = async () => {
     try {
-      const userRef = doc(db, 'users', auth.currentUser.uid);
-      await updateDoc(userRef, { online: !online });
+      await updateDoc(doc(db, 'users', auth.currentUser.uid), { online: !online });
       setOnline(!online);
-      setError(null);
-    } catch (err) {
+    } catch {
       setError('Status update failed');
     }
   };
 
   const saveSchedule = async () => {
     try {
-      const userRef = doc(db, 'users', auth.currentUser.uid);
-      await updateDoc(userRef, { schedule });
-      setError(null);
-    } catch (err) {
+      await updateDoc(doc(db, 'users', auth.currentUser.uid), { schedule });
+    } catch {
       setError('Schedule save failed');
     }
   };
 
- const handleBookingAction = async (bookingId, action) => {
+  const handleFileUpload = async (e, bookingId) => {
   try {
-    const bookingRef = doc(db, 'bookings', bookingId);
-    
-    if (action === 'accepted') {
-      const roomId = `room-${bookingId}`;
-      
-      // ✅ DOCTOR AUTO-CREATES ROOM + JOINS
-      await setDoc(doc(db, 'videoRooms', roomId), {
-        bookingId,
-        doctorId: auth.currentUser.uid,
-        customerId: pendingBookings.find(b => b.id === bookingId)?.customerId,
-        status: 'active',  // ✅ Changed from 'waiting' to 'active'
-        users: {
-          [auth.currentUser.uid]: 'doctor'  // ✅ Doctor immediately joins
-        },
-        createdAt: new Date().toISOString()
-      }, { merge: true });
+    const file = e.target.files[0];
+    if (!file) return;
 
-      // Update booking
-      await updateDoc(bookingRef, {
-        status: 'accepted',
-        videoRoomId: roomId,
-        updatedAt: new Date().toISOString()
-      });
-      
-      // ✅ DOCTOR AUTO-JOINS
-      navigate(`/video-call/${roomId}?booking=${bookingId}`);
-      
-    } else {
-      // Decline
-      await updateDoc(bookingRef, { status: action });
+    const allowedTypes = [
+      'application/pdf',
+      'image/jpeg',
+      'image/png',
+      'image/jpg',
+      'image/heic',
+      'image/heif'
+    ];
+
+    if (!allowedTypes.includes(file.type)) {
+      alert('Only PDF or image files are allowed');
+      return;
     }
-    
-    setError(null);
+
+    const storageRef = ref(
+      storage,
+      `prescriptions/${bookingId}/${Date.now()}_${file.name}`
+    );
+
+    // Upload to Firebase Storage
+    await uploadBytes(storageRef, file);
+    const downloadURL = await getDownloadURL(storageRef);
+
+    const bookingRef = doc(db, 'bookings', bookingId);
+
+    // Save in bookings
+    await updateDoc(bookingRef, {
+      prescriptions: arrayUnion({
+        name: file.name,
+        url: downloadURL,
+        type: file.type,
+        uploadedAt: new Date().toISOString()
+      }),
+      prescriptionCount: increment(1),
+      prescriptionNote: 'Prescription added'
+    });
+
+    alert('Prescription uploaded successfully');
   } catch (err) {
-    console.error('Action failed:', err);
-    setError('Action failed: ' + err.message);
+    console.error('Upload failed', err);
+    alert('Upload failed');
   }
 };
 
 
-  if (loading) {
-    return (
-      <div style={{
-        display: 'flex', justifyContent: 'center', alignItems: 'center',
-        minHeight: '100vh', background: '#f8fafc'
-      }}>
-        Loading...
-      </div>
-    );
-  }
+  const handleBookingAction = async (bookingId, action) => {
+    try {
+      const bookingRef = doc(db, 'bookings', bookingId);
+
+      if (action === 'accepted') {
+        const roomId = `room-${bookingId}`;
+
+        await setDoc(doc(db, 'videoRooms', roomId), {
+          bookingId,
+          doctorId: auth.currentUser.uid,
+          status: 'active',
+          users: { [auth.currentUser.uid]: 'doctor' },
+          createdAt: new Date().toISOString()
+        }, { merge: true });
+
+        await updateDoc(bookingRef, {
+          status: 'accepted',
+          videoRoomId: roomId,
+          updatedAt: new Date().toISOString()
+        });
+
+        navigate(`/video-call/${roomId}?booking=${bookingId}`);
+      } else {
+        await updateDoc(bookingRef, { status: action });
+      }
+    } catch (err) {
+      setError('Action failed: ' + err.message);
+    }
+  };
+
+  if (loading) return <div style={{ padding: 40 }}>Loading...</div>;
 
   return (
-    <div style={{
-      maxWidth: '600px', margin: '0 auto', padding: '20px',
-      background: '#f8fafc', minHeight: '100vh'
-    }}>
-      <h1 style={{textAlign: 'center', color: '#1e293b', marginBottom: '32px'}}>
-        Doctor Portal
-      </h1>
+    <div style={{ maxWidth: 600, margin: '0 auto', padding: 20 }}>
+      <h1 style={{ textAlign: 'center' }}>Doctor Portal</h1>
 
-      {/* Profile Card */}
-      <div style={{
-        background: 'white', padding: '24px', borderRadius: '12px',
-        boxShadow: '0 4px 6px rgba(0,0,0,0.05)', marginBottom: '24px'
-      }}>
-        <h3 style={{marginTop: 0, color: '#374151'}}>👤 Profile</h3>
-        <p><strong>Name:</strong> <span style={{color: '#1e293b'}}>{profile.name}</span></p>
-        <p><strong>Phone:</strong> <span style={{color: '#1e293b'}}>{profile.phoneNumber}</span></p>
-        <p><strong>License:</strong> <span style={{color: '#1e293b'}}>{profile.licenseNumber}</span></p>
-        <button 
-          onClick={toggleOnline}
-          style={{
-            width: '100%', padding: '14px', marginTop: '16px',
-            background: online ? '#dc2626' : '#059669',
-            color: 'white', border: 'none', borderRadius: '8px',
-            fontSize: '16px', fontWeight: 500, cursor: 'pointer'
-          }}
-        >
-          {online ? '🟢 Go Offline' : '🔴 Go Online'}
+      {/* PROFILE */}
+      <Card>
+        <h3>👤 Profile</h3>
+        <p><b>Name:</b> {profile.name}</p>
+        <p><b>Phone:</b> {profile.phoneNumber}</p>
+        <p><b>License:</b> {profile.licenseNumber}</p>
+        <button onClick={toggleOnline} style={btn(online ? '#dc2626' : '#059669')}>
+          {online ? 'Go Offline' : 'Go Online'}
         </button>
-      </div>
+      </Card>
 
-      {/* Schedule */}
-      <div style={{
-        background: 'white', padding: '24px', borderRadius: '12px',
-        boxShadow: '0 4px 6px rgba(0,0,0,0.05)', marginBottom: '24px'
-      }}>
-        <h3 style={{marginTop: 0, color: '#374151'}}>📅 Weekly Schedule</h3>
-        <div style={{maxHeight: '280px', overflowY: 'auto'}}>
-          {['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].map(day => (
-            <div key={day} style={{
-              display: 'flex', alignItems: 'center', gap: '12px',
-              padding: '12px 0', borderBottom: '1px solid #e2e8f0'
-            }}>
-              <span style={{minWidth: '60px', fontWeight: 600, textTransform: 'capitalize'}}>
-                {day}
-              </span>
-              <input 
-                type="time" 
-                value={schedule[day].from}
-                onChange={e => setSchedule(prev => ({
-                  ...prev, [day]: {...prev[day], from: e.target.value}
-                }))}
-                style={{
-                  padding: '10px 14px', borderRadius: '6px',
-                  border: '1px solid #d1d5db', background: 'white',
-                  fontSize: '14px'
-                }}
-              />
-              <span style={{color: '#6b7280', fontSize: '14px'}}>to</span>
-              <input 
-                type="time" 
-                value={schedule[day].to}
-                onChange={e => setSchedule(prev => ({
-                  ...prev, [day]: {...prev[day], to: e.target.value}
-                }))}
-                style={{
-                  padding: '10px 14px', borderRadius: '6px',
-                  border: '1px solid #d1d5db', background: 'white',
-                  fontSize: '14px'
-                }}
-              />
-            </div>
-          ))}
+      {/* WEEKLY SCHEDULE ACCORDION */}
+      <Card>
+        <div onClick={() => setShowSchedule(v => !v)} style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}>
+          <h3>📅 Weekly Schedule</h3>
+          <span>{showSchedule ? '▲' : '＋'}</span>
         </div>
-        <button 
-          onClick={saveSchedule}
-          style={{
-            width: '100%', padding: '14px', marginTop: '16px',
-            background: '#2563eb', color: 'white', border: 'none',
-            borderRadius: '8px', fontSize: '16px', fontWeight: 500,
-            cursor: 'pointer'
-          }}
-        >
-          💾 Save Schedule
-        </button>
-      </div>
 
-      {/* Bookings */}
-      <div>
-        <h3 style={{color: '#1e293b', marginBottom: '20px'}}>
-          📋 Consultations ({pendingBookings.length})
-        </h3>
-        {pendingBookings.length === 0 ? (
-          <div style={{
-            background: 'white', padding: '40px 24px', borderRadius: '12px',
-            textAlign: 'center', color: '#64748b', boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
-          }}>
-            No consultations waiting
-          </div>
-        ) : (
-          pendingBookings.map(booking => (
-            <div key={booking.id} style={{
-              background: 'white', padding: '20px', borderRadius: '12px',
-              marginBottom: '16px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
-            }}>
-              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-                <div>
-                  <p style={{margin: '0 0 4px 0', fontWeight: 600}}>
-                    {booking.customerName}
-                  </p>
-                  <p style={{color: '#64748b', margin: 0, fontSize: '14px'}}>
-                    {new Date(booking.createdAt).toLocaleString()}
-                  </p>
-                </div>
-                <span style={{
-                  padding: '6px 12px', borderRadius: '20px',
-                  background: booking.status === 'accepted' ? '#059669' : '#f59e0b',
-                  color: 'white', fontSize: '12px', fontWeight: 500
-                }}>
-                  {booking.status.toUpperCase()}
-                </span>
+        {showSchedule && (
+          <>
+            {Object.keys(schedule).map(day => (
+              <div key={day} style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                <b style={{ width: 50 }}>{day}</b>
+                <input type="time" value={schedule[day].from}
+                  onChange={e => setSchedule(s => ({ ...s, [day]: { ...s[day], from: e.target.value } }))} />
+                <input type="time" value={schedule[day].to}
+                  onChange={e => setSchedule(s => ({ ...s, [day]: { ...s[day], to: e.target.value } }))} />
               </div>
-              
-              {booking.status === 'pending' ? (
-                <div style={{display: 'flex', gap: '12px', marginTop: '16px'}}>
-                  <button 
-                    onClick={() => handleBookingAction(booking.id, 'accepted')}
-                    style={{
-                      flex: 1, padding: '12px', background: '#059669',
-                      color: 'white', border: 'none', borderRadius: '8px',
-                      fontWeight: 500, cursor: 'pointer', fontSize: '14px'
-                    }}
-                  >
-                    Accept
-                  </button>
-                  <button 
-                    onClick={() => handleBookingAction(booking.id, 'declined')}
-                    style={{
-                      flex: 1, padding: '12px', background: '#dc2626',
-                      color: 'white', border: 'none', borderRadius: '8px',
-                      fontWeight: 500, cursor: 'pointer', fontSize: '14px'
-                    }}
-                  >
-                    Decline
-                  </button>
-                </div>
-              ) : null}
-            </div>
-          ))
+            ))}
+            <button onClick={saveSchedule} style={btn('#2563eb')}>Save Schedule</button>
+          </>
         )}
+      </Card>
+
+      {/* PENDING BOOKINGS */}
+      <h3>📋 Active Consultations</h3>
+      {pendingBookings.map(b => (
+        <Card key={b.id}>
+          <b>{b.customerName}</b>
+          <p>{new Date(b.createdAt).toLocaleString()}</p>
+          {b.status === 'pending' && (
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button onClick={() => handleBookingAction(b.id, 'accepted')} style={btn('#059669')}>Accept</button>
+              <button onClick={() => handleBookingAction(b.id, 'declined')} style={btn('#dc2626')}>Decline</button>
+            </div>
+          )}
+        </Card>
+      ))}
+
+      {/* COMPLETED BOOKINGS */}
+      <h3 style={{ marginTop: 30 }}>✅ Completed Consultations</h3>
+
+      {completedBookings.length === 0 && <p>No completed bookings</p>}
+
+      {completedBookings.map(b => (
+  <Card key={b.id}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div>
+        <b>{b.customerName}</b>
+        <p style={{ fontSize: 13, opacity: 0.7 }}>
+          {b.callEndedAt?.toDate?.().toLocaleString() || 'N/A'}
+        </p>
+        <p style={{ fontSize: 13, fontWeight: 'bold', color: '#2563eb' }}>
+          ⏱ Duration: {Math.floor((b.callDurationSeconds || 0) / 60)}m {(b.callDurationSeconds || 0) % 60}s
+        </p>
+        {b.prescriptionCount > 0 && (
+  <p style={{ fontSize: 12, color: '#059669', marginTop: 6 }}>
+    📎 {b.prescriptionCount} prescription{b.prescriptionCount > 1 ? 's' : ''} added
+  </p>
+)}
+
       </div>
 
-      {error && (
-        <div style={{
-          background: '#fee2e2', border: '1px solid #fecaca', color: '#dc2626',
-          padding: '16px', borderRadius: '8px', marginTop: '24px', textAlign: 'center'
-        }}>
-          {error} <button onClick={() => setError(null)} 
-            style={{background: 'none', border: 'none', color: '#dc2626', cursor: 'pointer'}}>
-            ×
-          </button>
-        </div>
-      )}
+            <button
+  onClick={() => document.getElementById(`upload-${b.id}`).click()}
+  style={{
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 40,
+    height: 40,
+    background: '#2563eb',
+    color: '#fff',
+    borderRadius: '50%',
+    cursor: 'pointer',
+    fontSize: 24,
+    fontWeight: 'bold',
+    border: 'none',
+    boxShadow: '0 2px 4px rgba(37, 99, 235, 0.3)'
+  }}
+>
+  +
+</button>
+
+<input
+  id={`upload-${b.id}`}
+  type="file"
+  accept=".pdf,image/*,.heic,.heif"
+  style={{ display: 'none' }}
+  onChange={(e) => handleFileUpload(e, b.id)}
+/>
+
+          </div>
+        </Card>
+      ))}
+
+      {error && <p style={{ color: 'red' }}>{error}</p>}
     </div>
   );
 };
+
+/* ================= STYLES ================= */
+const Card = ({ children }) => (
+  <div style={{
+    background: '#fff',
+    padding: 20,
+    borderRadius: 12,
+    marginBottom: 20,
+    boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
+  }}>
+    {children}
+  </div>
+);
+
+const btn = (bg) => ({
+  background: bg,
+  color: '#fff',
+  padding: 12,
+  border: 'none',
+  borderRadius: 8,
+  cursor: 'pointer',
+  width: '100%'
+});
 
 export default DoctorPortal;

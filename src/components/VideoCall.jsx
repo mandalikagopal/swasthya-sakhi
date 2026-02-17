@@ -29,6 +29,7 @@ const VideoCall = () => {
   const unsubscribeRoomRef = useRef(null);
   const isPeerActiveRef = useRef(false);
   const callStartTimeRef = useRef(null);
+  const durationIntervalRef = useRef(null);
 
   const [userRole, setUserRole] = useState('loading');
   const [callStatus, setCallStatus] = useState('waiting');
@@ -37,6 +38,14 @@ const VideoCall = () => {
 
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
+
+  /* ================= UTILS ================= */
+  const formatDuration = (sec) => {
+    const h = String(Math.floor(sec / 3600)).padStart(2, '0');
+    const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${h}:${m}:${s}`;
+  };
 
   /* ================= CLEANUP ================= */
   const cleanupEverything = useCallback(() => {
@@ -48,6 +57,11 @@ const VideoCall = () => {
     if (peerRef.current) {
       peerRef.current.destroy();
       peerRef.current = null;
+    }
+
+    if (durationIntervalRef.current) {
+      clearInterval(durationIntervalRef.current);
+      durationIntervalRef.current = null;
     }
 
     if (remoteVideo.current) remoteVideo.current.srcObject = null;
@@ -98,6 +112,12 @@ const VideoCall = () => {
 
       if (!callStartTimeRef.current) {
         callStartTimeRef.current = Date.now();
+
+        durationIntervalRef.current = setInterval(() => {
+          const secs = Math.floor((Date.now() - callStartTimeRef.current) / 1000);
+          setDuration(secs);
+        }, 1000);
+
         await updateDoc(doc(db, 'bookings', bookingId), {
           status: 'in_call',
           callStartedAt: serverTimestamp()
@@ -127,8 +147,19 @@ const VideoCall = () => {
 
     if (initialSignal) peer.signal(initialSignal);
 
-    peer.on('close', cleanupEverything);
-    peer.on('error', cleanupEverything);
+    peer.on('close', () => {
+      cleanupEverything();
+      // also mark ended if not yet ended from other side
+      if (roomRef.current) {
+        updateDoc(roomRef.current, { ended: true, endedAt: serverTimestamp() }).catch(() => {});
+      }
+    });
+    peer.on('error', () => {
+      cleanupEverything();
+      if (roomRef.current) {
+        updateDoc(roomRef.current, { ended: true, endedAt: serverTimestamp() }).catch(() => {});
+      }
+    });
   }, [bookingId, cleanupEverything]);
 
   /* ================= INIT ================= */
@@ -161,7 +192,15 @@ const VideoCall = () => {
         const data = snap.data();
         if (!data) return;
 
+        // END CALL FOR BOTH
         if (data.ended) {
+          // compute duration if not already computed on this side
+          if (!callStartTimeRef.current && data.callStartedAt && data.callEndedAt) {
+            const start = data.callStartedAt.toMillis ? data.callStartedAt.toMillis() : Date.now();
+            const end = data.callEndedAt.toMillis ? data.callEndedAt.toMillis() : Date.now();
+            const secs = Math.max(0, Math.floor((end - start) / 1000));
+            setDuration(secs);
+          }
           cleanupEverything();
           navigate('/');
         }
@@ -207,9 +246,10 @@ const VideoCall = () => {
   };
 
   const endCall = async () => {
+    const now = Date.now();
     const durationSeconds = callStartTimeRef.current
-      ? Math.floor((Date.now() - callStartTimeRef.current) / 1000)
-      : 0;
+      ? Math.floor((now - callStartTimeRef.current) / 1000)
+      : duration;
 
     await updateDoc(doc(db, 'bookings', bookingId), {
       status: 'completed',
@@ -217,10 +257,12 @@ const VideoCall = () => {
       callDurationSeconds: durationSeconds
     });
 
-    await updateDoc(roomRef.current, {
-      ended: true,
-      endedAt: serverTimestamp()
-    });
+    if (roomRef.current) {
+      await updateDoc(roomRef.current, {
+        ended: true,
+        endedAt: serverTimestamp()
+      });
+    }
 
     await clearRoomData();
     cleanupEverything();
@@ -241,7 +283,22 @@ const VideoCall = () => {
         style={{ width: '100%', height: '100%', objectFit: 'cover' }}
       />
 
-      {/* Picture-in-picture local video */}
+      {/* Duration */}
+      <div style={{
+        position: 'absolute',
+        top: 12,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        background: 'rgba(0,0,0,0.6)',
+        color: '#fff',
+        padding: '6px 14px',
+        borderRadius: 20,
+        fontSize: 14
+      }}>
+        ⏱ {formatDuration(duration)}
+      </div>
+
+      {/* PiP Local */}
       <video
         ref={localVideo}
         autoPlay
