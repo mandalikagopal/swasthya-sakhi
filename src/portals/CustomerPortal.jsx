@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { collection, query, where, onSnapshot, doc, getDoc, addDoc, writeBatch } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, getDoc, addDoc, writeBatch, updateDoc, increment } from 'firebase/firestore';
 import { db, auth } from '../services/firebase';
 import { useNavigate } from 'react-router-dom';
-import RazorpayButton from '../components/RazorpayButton';
+import WalletManager from '../components/WalletManager';
 
 const CustomerPortal = () => {
   // ✅ Updated: Full medicines list from database + fallback
@@ -32,6 +32,11 @@ const CustomerPortal = () => {
   const [loading, setLoading] = useState(true);
   const [prescriptions, setPrescriptions] = useState([]);
   const navigate = useNavigate();
+  const [myOrders, setMyOrders] = useState([]);
+  const [showOrder, setShowOrder] = useState(false);
+  const [showPharmacy, setPharmacy] = useState(false);
+  const [showBookings, setBookings] = useState(false);
+  const [showPrescriptionslist, setPrescriptionslist] = useState(false);
 
   const categories = ['All', ...new Set(medicines.map(m => m.category || 'General'))];
   const filteredMedicines = selectedCategory === 'All' 
@@ -67,6 +72,31 @@ const CustomerPortal = () => {
     return unsub;
   }, []);
 
+  useEffect(() => {
+  // Fail-safe: Force stop any leaking camera/mic tracks from a previous video call
+  const killLeakingHardware = async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const hasActiveHardware = devices.some(device => device.kind === 'videoinput' || device.kind === 'audioinput');
+
+      if (hasActiveHardware) {
+        // We request a dummy stream just to grab the current active session and kill it
+        navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+          .then(stream => {
+            stream.getTracks().forEach(track => track.stop());
+          })
+          .catch(() => {
+            console.log("audio and video inactive");
+          });
+      }
+    } catch (err) {
+      console.log("Hardware cleanup skipped:", err);
+    }
+  };
+
+  killLeakingHardware();
+}, []);
+
 //   const uploadMedicinesToDB = async () => {
 //   try {
 //     const batch = writeBatch(db);
@@ -96,14 +126,37 @@ const CustomerPortal = () => {
 
     const unsubBookings = listenToMyBookings(currentUser.uid);
     const unsubDoctors = loadOnlineDoctors();
+    const unsubOrders = listenToMyOrders(currentUser.uid); // ✅ Add this
     
     loadProfile(currentUser.uid);
 
     return () => {
-      unsubBookings();
-      unsubDoctors();
+      //unsubProfile(); 
+    unsubBookings();
+    unsubDoctors();
+    unsubOrders();
     };
   }, []);
+
+  const listenToMyOrders = (userId) => {
+    const q = query(collection(db, 'orders'), where('userId', '==', userId));
+    
+    return onSnapshot(q, (snap) => {
+      const ordersList = [];
+      snap.forEach((doc) => {
+        ordersList.push({ id: doc.id, ...doc.data() });
+      });
+      
+      // Sort manually in JS to avoid "Missing Index" errors while testing
+      const sorted = ordersList.sort((a, b) => {
+        const dateA = a.createdAt ? new Date(a.createdAt) : new Date(0);
+        const dateB = b.createdAt ? new Date(b.createdAt) : new Date(0);
+        return dateB - dateA;
+      });
+
+      setMyOrders(sorted);
+    });
+  };
 
   const loadOnlineDoctors = () => {
     const q = query(collection(db, 'users'), where('role', '==', 'doctor'), where('online', '==', true));
@@ -114,18 +167,17 @@ const CustomerPortal = () => {
     });
   };
 
-  const loadProfile = async (uid) => {
-    try {
-      const snap = await getDoc(doc(db, 'users', uid));
-      if (snap.exists()) {
-        setUserProfile(snap.data());
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
+  const loadProfile = (uid) => {
+  const userRef = doc(db, 'users', uid);
+  // This listens to Firestore. When WalletManager updates the DB, 
+  // this function triggers automatically and updates the UI.
+  return onSnapshot(userRef, (snap) => {
+    if (snap.exists()) {
+      setUserProfile(snap.data());
     }
-  };
+    setLoading(false);
+  });
+};
 
   const listenToMyBookings = (customerId) => {
     const q = query(collection(db, 'bookings'), where('customerId', '==', customerId));
@@ -166,22 +218,73 @@ const CustomerPortal = () => {
     return new Date(0);
   };
 
-  const bookConsultation = async (doctorId, doctorName) => {
+  const bookConsultation = async (doctorId, doctorName, doctorRate) => {
+  const balance = userProfile?.walletBalance || 0;
+  
+  // 1. Check if user has enough money
+  if (balance < doctorRate) {
+    alert(`Insufficient balance! Consultation cost is ₹${doctorRate}. Please top up your wallet.`);
+    return;
+  }
+
+  if(doctorId && doctorName && doctorRate){
     try {
-      await addDoc(collection(db, 'bookings'), {
+      const batch = writeBatch(db); // Atomic transaction
+
+      // 2. References
+      const customerRef = doc(db, 'users', auth.currentUser.uid);
+      const doctorRef = doc(db, 'users', doctorId);
+      
+      // 3. Deduct from Customer & Add to Doctor's WAITING balance
+      batch.update(customerRef, {
+        walletBalance: increment(-doctorRate)
+      });
+
+      batch.update(doctorRef, {
+        waitingBalance: increment(0.9 * doctorRate) // ✅ Money is held in "Waiting"
+      });
+
+      // 4. Create the Booking entry
+      const bookingRef = doc(collection(db, 'bookings'));
+      batch.set(bookingRef, {
         customerId: auth.currentUser.uid,
         doctorId,
         customerName: userProfile?.name || 'Customer',
         doctorName,
         createdAt: new Date().toISOString(),
-        status: 'pending'
+        status: 'pending',
+        amountPaid: doctorRate,
+        paymentStatus: 'escrow' // Track that money is in waiting state
       });
-      alert('✅ Booking request sent!');
+
+      // 5. Log transaction for Customer (Debit)
+      const customerTransRef = doc(collection(db, 'transactions'));
+      batch.set(customerTransRef, {
+        userId: auth.currentUser.uid,
+        amount: doctorRate,
+        type: 'debit',
+        description: `Consultation Fee (Held for Dr. ${doctorName})`,
+        date: new Date().toISOString()
+      });
+
+      // 6. Log transaction for Doctor (Pending Credit)
+      const doctorTransRef = doc(collection(db, 'transactions'));
+      batch.set(doctorTransRef, {
+        userId: doctorId,
+        amount: doctorRate,
+        type: 'pending_credit',
+        description: `Incoming Consultation from ${userProfile?.name || 'Customer'} (Awaiting Completion)`,
+        date: new Date().toISOString()
+      });
+
+      await batch.commit();
+      alert('✅ Payment held in escrow. Booking request sent!');
     } catch (err) {
       console.error('Booking error:', err);
       alert(`Failed: ${err.message}`);
     }
-  };
+  }
+};
 
   const downloadPrescription = (url) => {
     if (!url) return alert("File not found");
@@ -192,6 +295,31 @@ const CustomerPortal = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const handleMedicineCheckout = async () => {
+    const total = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const balance = userProfile?.walletBalance || 0;
+
+    if (balance < total) return alert("Insufficient balance!");
+
+    try {
+      const userRef = doc(db, 'users', auth.currentUser.uid);
+      await updateDoc(userRef, { walletBalance: increment(-total) });
+
+      await addDoc(collection(db, 'orders'), {
+        userId: auth.currentUser.uid,
+        items: cart,
+        totalAmount: total,
+        status: 'paid',
+        createdAt: new Date().toISOString()
+      });
+
+      setCart([]);
+      alert('✅ Order placed successfully!');
+    } catch (err) {
+      alert("Error: " + err.message);
+    }
   };
 
   const CustomerJoinButton = ({ roomId, bookingId }) => {
@@ -227,6 +355,28 @@ const CustomerPortal = () => {
     );
   };
 
+  const safeDate = (value) => {
+  if (!value) return '—';
+  try {
+    if (value.toDate) return value.toDate().toLocaleString();
+    return new Date(value).toLocaleString();
+  } catch {
+    return '—';
+  }
+};
+
+const Card = ({ children }) => (
+  <div style={{
+    background: '#fff',
+    padding: 20,
+    borderRadius: 12,
+    marginBottom: 20,
+    boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
+  }}>
+    {children}
+  </div>
+);
+
   const callAmbulance = () => window.location.href = 'tel:108';
 
   const formatDuration = (seconds) => {
@@ -249,7 +399,7 @@ const CustomerPortal = () => {
         <h1 style={{color: '#1e293b', marginBottom: '8px'}}>Swasthya Sakhi</h1>
         <p style={{color: '#64748b'}}>Welcome, {userProfile?.name || 'Customer'}</p>
       </div>
-
+      <WalletManager balance={userProfile?.walletBalance || 0} />
       {/* Emergency */}
       <div style={{marginBottom: '30px'}}>
         <button onClick={callAmbulance} style={{
@@ -262,15 +412,135 @@ const CustomerPortal = () => {
       </div>
 
       {cart.length > 0 && (
-        <div style={{ marginBottom: '30px' }}>
-          <RazorpayButton cart={cart} setCart={setCart} />
+  <div style={{ 
+    background: 'white', padding: '20px', borderRadius: '12px', 
+    marginBottom: '30px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' 
+  }}>
+    <h3 style={{margin: '0 0 10px 0'}}>🛒 Your Cart</h3>
+    {cart.map(item => (
+      <div key={item.id} style={{display: 'flex', justifyContent: 'space-between', fontSize: '14px'}}>
+        <span>{item.name} (x{item.quantity})</span>
+        <span>₹{item.price * item.quantity}</span>
+      </div>
+    ))}
+    <hr style={{margin: '15px 0', border: '0', borderTop: '1px solid #eee'}} />
+    <div style={{display: 'flex', justifyContent: 'space-between', fontWeight: 'bold', marginBottom: '15px'}}>
+      <span>Total:</span>
+      <span>₹{cart.reduce((sum, item) => sum + (item.price * item.quantity), 0)}</span>
+    </div>
+    <button 
+      onClick={handleMedicineCheckout}
+      style={{
+        width: '100%', padding: '12px', background: '#059669', 
+        color: 'white', border: 'none', borderRadius: '8px', fontWeight: 'bold'
+      }}
+    >
+      Pay from Wallet
+    </button>
+  </div>
+)}
+
+{myBookings.length > 0 && (
+  myBookings
+    .filter(booking => booking.status === 'accepted')
+    .map(booking => (
+      <div
+        key={booking.id}
+        style={{
+          background: 'white',
+          padding: '20px',
+          borderRadius: '12px',
+          marginBottom: '16px',
+          boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <p style={{ margin: '0 0 4px 0', fontWeight: 600 }}>
+              {booking.doctorName}
+            </p>
+            <p style={{ color: '#64748b', margin: 0, fontSize: '14px' }}>
+              {new Date(booking.createdAt).toLocaleString()}
+            </p>
+          </div>
+
+          <span
+            style={{
+              padding: '6px 12px',
+              borderRadius: '20px',
+              background: '#059669',
+              color: 'white',
+              fontSize: '12px',
+              fontWeight: 500
+            }}
+          >
+            ACCEPTED
+          </span>
         </div>
-      )}
+
+        {booking.videoRoomId && (
+          <CustomerJoinButton
+            roomId={booking.videoRoomId}
+            bookingId={booking.id}
+          />
+        )}
+      </div>
+    ))
+)}
+
+
+ {/* Online Doctors */}
+      <div style={{marginBottom: '40px'}}>
+        <h2 style={{color: '#1e293b', marginBottom: '20px'}}>
+          👨‍⚕️ Online Doctors ({onlineDoctors.length})
+        </h2>
+        {onlineDoctors.length === 0 ? (
+          <div style={{
+            textAlign: 'center', padding: '60px 20px',
+            background: 'white', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
+          }}>
+            <p style={{color: '#64748b'}}>No doctors online right now</p>
+          </div>
+        ) : (
+          <div style={{
+            display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+            gap: '20px'
+          }}>
+            {onlineDoctors.map(doctor => (
+              <div key={doctor.id} style={{
+                background: 'white', padding: '24px', borderRadius: '12px',
+                boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
+              }}>
+                <div>
+                  <h3 style={{margin: '0 0 8px 0', color: '#1e293b'}}>{doctor.name}</h3>
+                  <p style={{color: '#64748b', margin: '0 0 12px 0'}}>{doctor.specialization}</p>
+                  <p style={{fontWeight: 600, color: '#059669', margin: '0 0 16px 0'}}>
+                    ₹{doctor.rate || 100}
+                  </p>
+                </div>
+                <button onClick={() => bookConsultation(doctor.id, doctor.name, doctor.rate)} style={{
+                  width: '100%', padding: '14px', background: '#2563eb',
+                  color: 'white', border: 'none', borderRadius: '8px',
+                  fontWeight: 500, cursor: 'pointer'
+                }}>
+                  Book Consultation
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* ✅ RESPONSIVE MEDICINE SECTION */}
-      <h2 style={{color: '#1e293b', marginBottom: '20px'}}>💊 Pharmacy</h2>
-      
-      <div className="medicine-container" style={{ 
+      <Card>
+        <div onClick={() => setPharmacy(v => !v)} style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}>
+          <h3 style={{color: '#1e293b'}}>💊 Pharmacy</h3>
+          <span>{showPharmacy? '▲' : '＋'}</span>
+        </div>
+
+        {showPharmacy && (
+          <>
+         <div className="medicine-container" style={{ 
         display: 'flex', 
         gap: '20px', 
         flexDirection: window.innerWidth < 768 ? 'column' : 'row', // Basic responsive check
@@ -371,54 +641,62 @@ const CustomerPortal = () => {
         </div>
       </div>
 
-      {/* Online Doctors */}
-      <div style={{marginBottom: '40px'}}>
-        <h2 style={{color: '#1e293b', marginBottom: '20px'}}>
-          👨‍⚕️ Online Doctors ({onlineDoctors.length})
-        </h2>
-        {onlineDoctors.length === 0 ? (
-          <div style={{
-            textAlign: 'center', padding: '60px 20px',
-            background: 'white', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
-          }}>
-            <p style={{color: '#64748b'}}>No doctors online right now</p>
-          </div>
+          </>
+        )}
+      </Card>
+      
+      {/* Orders Section */}
+      <Card>
+        <div onClick={() => setShowOrder(v => !v)} style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}>
+          <h3>📦 My Medicine Orders ({myOrders.length})</h3>
+          <span>{showOrder ? '▲' : '＋'}</span>
+        </div>
+
+        {showOrder && (
+          <>
+         <div style={{ marginBottom: '40px' }}>
+        <h2 style={{ color: '#1e293b', marginBottom: '20px' }}></h2>
+        {myOrders.length === 0 ? (
+          <p style={{ color: '#64748b', background: 'white', padding: '20px', borderRadius: '12px', textAlign: 'center' }}>No orders found yet.</p>
         ) : (
-          <div style={{
-            display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
-            gap: '20px'
-          }}>
-            {onlineDoctors.map(doctor => (
-              <div key={doctor.id} style={{
-                background: 'white', padding: '24px', borderRadius: '12px',
-                boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
-              }}>
-                <div>
-                  <h3 style={{margin: '0 0 8px 0', color: '#1e293b'}}>{doctor.name}</h3>
-                  <p style={{color: '#64748b', margin: '0 0 12px 0'}}>{doctor.specialization}</p>
-                  <p style={{fontWeight: 600, color: '#059669', margin: '0 0 16px 0'}}>
-                    ₹{doctor.rate || 100}
-                  </p>
+          <div style={{ display: 'grid', gap: '15px' }}>
+            {myOrders.map(order => (
+              <div key={order.id} style={{ background: 'white', padding: '20px', borderRadius: '12px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', borderLeft: '5px solid #059669' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
+                  <span style={{ fontWeight: 'bold', color: '#64748b' }}>Order #{order.id.slice(-6).toUpperCase()}</span>
+<span style={{ fontSize: '12px', color: '#94a3b8' }}>
+  {safeDate(order.createdAt)}
+</span>
                 </div>
-                <button onClick={() => bookConsultation(doctor.id, doctor.name)} style={{
-                  width: '100%', padding: '14px', background: '#2563eb',
-                  color: 'white', border: 'none', borderRadius: '8px',
-                  fontWeight: 500, cursor: 'pointer'
-                }}>
-                  Book Consultation
-                </button>
+                <div style={{ background: '#f8fafc', padding: '10px', borderRadius: '8px' }}>
+                  {order.items?.map((item, idx) => (
+                    <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+                      <span>{item.name} x{item.quantity}</span>
+                      <span>₹{item.price * item.quantity}</span>
+                    </div>
+                  ))}
+                </div>
+                <p style={{ textAlign: 'right', fontWeight: 'bold', marginTop: '10px', margin: 0 }}>Total Paid: ₹{order.totalAmount}</p>
               </div>
             ))}
           </div>
         )}
       </div>
 
+          </>
+        )}
+      </Card>
+     
       {/* My Bookings */}
-      <div style={{marginBottom: '40px'}}>
-        <h2 style={{color: '#1e293b', marginBottom: '20px'}}>
-          📋 My Bookings ({myBookings.length})
-        </h2>
-        {myBookings.length === 0 ? (
+      <Card>
+        <div onClick={() => setBookings(v => !v)} style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}>
+          <h3>📋 My Bookings ({myBookings.length})</h3>
+          <span>{showBookings ? '▲' : '＋'}</span>
+        </div>
+
+        {showBookings && (
+          <>
+         {myBookings.length === 0 ? (
           <div style={{
             textAlign: 'center', padding: '60px 20px',
             background: 'white', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
@@ -475,14 +753,20 @@ const CustomerPortal = () => {
             </div>
           ))
         )}
-      </div>
-
+          </>
+        )}
+      </Card>
       {/* Prescriptions (from bookings) */}
-      {prescriptions.length > 0 && (
+      <Card>
+        <div onClick={() => setPrescriptionslist(v => !v)} style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}>
+          <h3>💊 My Prescriptions ({prescriptions.length})</h3>
+          <span>{showPrescriptionslist ? '▲' : '＋'}</span>
+        </div>
+
+        {showPrescriptionslist && (
+          <>
+        {prescriptions.length > 0 ? (
         <div>
-          <h2 style={{color: '#1e293b', marginBottom: '20px'}}>
-            💊 My Prescriptions ({prescriptions.length})
-          </h2>
           <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '16px'}}>
             {prescriptions.map((p, index) => (
               <div key={index} style={{ background: 'white', padding: '20px', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }}>
@@ -507,11 +791,22 @@ const CustomerPortal = () => {
               </div>
             ))}
           </div>
-          {/* <button onClick={uploadMedicinesToDB}>Sync Medicines to DB</button> */}
         </div>
+      ) : (
+        <div style={{
+            textAlign: 'center', padding: '60px 20px',
+            background: 'white', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)'
+          }}>
+            <p style={{color: '#64748b'}}>No Prescriptions to Show</p>
+          </div>
       )}
+          </>
+        )}
+      </Card>
+      
     </div>
   );
+  
 };
 
 export default CustomerPortal;

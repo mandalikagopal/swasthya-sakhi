@@ -49,6 +49,7 @@ const VideoCall = () => {
 
   /* ================= CLEANUP ================= */
   const cleanupEverything = useCallback(() => {
+    stopMediaTracks();
     if (unsubscribeRoomRef.current) {
       unsubscribeRoomRef.current();
       unsubscribeRoomRef.current = null;
@@ -147,13 +148,20 @@ const VideoCall = () => {
 
     if (initialSignal) peer.signal(initialSignal);
 
-    peer.on('close', () => {
-      cleanupEverything();
-      // also mark ended if not yet ended from other side
-      if (roomRef.current) {
-        updateDoc(roomRef.current, { ended: true, endedAt: serverTimestamp() }).catch(() => {});
-      }
-    });
+    peer.on('close', async () => {
+  if (roomRef.current) {
+    try {
+      await updateDoc(roomRef.current, {
+        ended: true,
+        active: false,
+        endedAt: serverTimestamp()
+      });
+    } catch {}
+  }
+
+  cleanupEverything();
+});
+
     peer.on('error', () => {
       cleanupEverything();
       if (roomRef.current) {
@@ -161,6 +169,15 @@ const VideoCall = () => {
       }
     });
   }, [bookingId, cleanupEverything]);
+
+  const stopMediaTracks = useCallback(() => {
+  if (localStreamRef.current) {
+    localStreamRef.current.getTracks().forEach(track => {
+      track.stop(); // 🛑 Physically shuts off the camera/mic light
+    });
+    localStreamRef.current = null;
+  }
+}, []);
 
   /* ================= INIT ================= */
   useEffect(() => {
@@ -201,8 +218,12 @@ const VideoCall = () => {
             const secs = Math.max(0, Math.floor((end - start) / 1000));
             setDuration(secs);
           }
+          if (localStreamRef.current) {
+    localStreamRef.current.getTracks().forEach(track => track.stop());
+    localStreamRef.current = null;
+  }
           cleanupEverything();
-          navigate('/');
+          window.location.href = '/';
         }
 
         if (role === 'doctor' && !data.offer && !isPeerActiveRef.current) {
@@ -223,6 +244,10 @@ const VideoCall = () => {
     init();
 
     return () => {
+      if (localStreamRef.current) {
+    localStreamRef.current.getTracks().forEach(track => track.stop());
+    localStreamRef.current = null;
+  }
       cleanupEverything();
       localStreamRef.current?.getTracks().forEach(t => t.stop());
     };
@@ -246,28 +271,41 @@ const VideoCall = () => {
   };
 
   const endCall = async () => {
+  try {
     const now = Date.now();
     const durationSeconds = callStartTimeRef.current
       ? Math.floor((now - callStartTimeRef.current) / 1000)
       : duration;
 
+    // 1. Update the Booking status for history/records
     await updateDoc(doc(db, 'bookings', bookingId), {
       status: 'completed',
       callEndedAt: serverTimestamp(),
       callDurationSeconds: durationSeconds
     });
 
+    // 2. Trigger the "End" for the other user via the Room document
     if (roomRef.current) {
       await updateDoc(roomRef.current, {
         ended: true,
+        active: false, // Mark room inactive
         endedAt: serverTimestamp()
       });
     }
 
+    // 3. Clear signaling data (ICE candidates)
     await clearRoomData();
+    
+    // 4. Local cleanup and redirect
     cleanupEverything();
-    navigate('/');
-  };
+    window.location.href = '/';
+  } catch (err) {
+    console.error("Error ending call:", err);
+    // Even if DB update fails, cleanup locally
+    cleanupEverything();
+    window.location.href = '/';
+  }
+};
 
   /* ================= UI ================= */
   if (callStatus === 'completed') {
@@ -280,7 +318,8 @@ const VideoCall = () => {
         ref={remoteVideo}
         autoPlay
         playsInline
-        style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+        style={{ width: '100%', height: '100%', objectFit: 'cover',  transform: 'none', WebkitTransform: 'none' }}
+        
       />
 
       {/* Duration */}
@@ -312,9 +351,11 @@ const VideoCall = () => {
           height: 160,
           borderRadius: 12,
           border: '2px solid #fff',
-          objectFit: 'cover'
+          objectFit: 'cover',
+          transform: 'none', // 👈 Add this to fix the mirror effect
+          WebkitTransform: 'none' // For Safari support
         }}
-      />
+/>
 
       {/* Controls */}
       <div style={{

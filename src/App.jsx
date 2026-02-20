@@ -39,8 +39,18 @@ function AuthWrapper() {
         const isOnAuthPage = currentPath === '/login' || currentPath === '/register';
 
         if (userData.role && userData.phoneNumber && !isOnCorrectPortal && !isOnVideoCall && !isOnAuthPage) {
-          console.log('Redirecting to portal from:', currentPath);
-          navigate(`/${userData.role}-portal`, { replace: true });
+          if (userData.role === "customer") {
+            // Regular customers can always access their portal
+            navigate(`/customer-portal`, { replace: true });
+          } else if (userData.verificationStatus === "approved") {
+            // Doctors/Medical/Delivery can only enter if APPROVED
+            navigate(`/${userData.role}-portal`, { replace: true });
+          } else {
+            // If a doctor is pending or rejected, keep them on landing page
+            console.log('USER NOT VERIFIED - REDIRECTING TO HOME PAGE');
+            navigate(`/`, { replace: true });
+            alert("Your account is currently under verification. Please wait for admin approval.");
+          }
         }
       } else {
         setUser(firebaseUser);
