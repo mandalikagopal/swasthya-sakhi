@@ -3,6 +3,7 @@ import { collection, query, where, onSnapshot, doc, getDoc, addDoc, writeBatch, 
 import { db, auth } from '../services/firebase';
 import { useNavigate } from 'react-router-dom';
 import WalletManager from '../components/WalletManager';
+import { useCart } from '../context/CartContext';
 
 const CustomerPortal = () => {
   // ✅ Updated: Full medicines list from database + fallback
@@ -25,7 +26,7 @@ const CustomerPortal = () => {
   // ]);
   const [medicines, setMedicines] = useState([]);
   const [onlineDoctors, setOnlineDoctors] = useState([]);
-  const [cart, setCart] = useState([]); // ✅ NEW: Cart state
+  const { cart, addtoCart, updateQuantity, removeFromCart, clearCart, cartTotalItems } = useCart();
   const [selectedCategory, setSelectedCategory] = useState('All'); // ✅ NEW: Category state
   const [myBookings, setMyBookings] = useState([]);
   const [userProfile, setUserProfile] = useState(null);
@@ -44,21 +45,21 @@ const CustomerPortal = () => {
     : medicines.filter(m => (m.category || 'General') === selectedCategory);
 
   const addToCart = (med) => {
-    setCart((prevCart) => {
-      // Check if item already exists based on Firestore ID
-      const existingItem = prevCart.find(item => item.id === med.id);
-      
-      if (existingItem) {
-        return prevCart.map(item =>
-          item.id === med.id 
-            ? { ...item, quantity: (item.quantity || 1) + 1 } 
-            : item
-        );
-      }
-      // Add new item with quantity 1
-      return [...prevCart, { ...med, quantity: 1 }];
-    });
+    addtoCart(med);
   };
+
+  useEffect(() => {
+  try {
+    if (cart.length === 0) {
+      localStorage.removeItem('swasthya_cart');
+    } else {
+      localStorage.setItem('swasthya_cart', JSON.stringify(cart));
+    }
+  } catch (e) {
+    console.log('Failed to save cart to storage', e);
+  }
+}, [cart]);
+
   // ✅ Load medicines from Firestore
   useEffect(() => {
     const q = query(collection(db, 'medicines'));
@@ -314,8 +315,7 @@ const CustomerPortal = () => {
         status: 'paid',
         createdAt: new Date().toISOString()
       });
-
-      setCart([]);
+      clearCart();
       alert('✅ Order placed successfully!');
     } catch (err) {
       alert("Error: " + err.message);
@@ -412,22 +412,107 @@ const Card = ({ children }) => (
       </div>
 
       {cart.length > 0 && (
-  <div style={{ 
+  <div className="cart-section" style={{
     background: 'white', padding: '20px', borderRadius: '12px', 
     marginBottom: '30px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' 
   }}>
     <h3 style={{margin: '0 0 10px 0'}}>🛒 Your Cart</h3>
+
     {cart.map(item => (
-      <div key={item.id} style={{display: 'flex', justifyContent: 'space-between', fontSize: '14px'}}>
-        <span>{item.name} (x{item.quantity})</span>
-        <span>₹{item.price * item.quantity}</span>
+      <div 
+        key={item.id} 
+        style={{ 
+          display: 'flex', 
+          justifyContent: 'space-between', 
+          alignItems: 'center',
+          fontSize: '14px',
+          marginBottom: '8px'
+        }}
+      >
+        <div style={{ flex: 1 }}>
+          <span>{item.name}</span>
+        </div>
+
+        {/* Quantity controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <button
+            onClick={() => {
+              updateQuantity(item.id, -1);
+            }}
+            style={{
+              width: 24,
+              height: 24,
+              borderRadius: '50%',
+              border: '1px solid #2563eb',
+              background: '#2563eb',
+              color: '#fff',
+              cursor: 'pointer',
+              lineHeight: '20px',
+              textAlign: 'center',
+              padding: '0'
+            }}
+          >
+            −
+          </button>
+
+          <span style={{ minWidth: 20, textAlign: 'center' }}>
+            {item.quantity || 1}
+          </span>
+
+          <button
+            onClick={() => {
+              updateQuantity(item.id, 1);
+            }}
+            style={{
+              width: 24,
+              height: 24,
+              borderRadius: '50%',
+              border: '1px solid #2563eb',
+              background: '#2563eb',
+              color: '#fff',
+              cursor: 'pointer',
+              lineHeight: '20px',
+              textAlign: 'center',
+              padding: '0'
+            }}
+          >
+            +
+          </button>
+        </div>
+
+        {/* Line total */}
+        <div style={{ width: 70, textAlign: 'right' }}>
+          ₹{item.price * (item.quantity || 1)}
+        </div>
+
+        {/* Remove item */}
+        <button
+          onClick={() => {
+            removeFromCart(item.id);
+          }}
+          style={{
+            marginLeft: 8,
+            border: 'none',
+            background: 'transparent',
+            color: '#ef4444',
+            cursor: 'pointer',
+            fontSize: 16,
+            fontWeight: 'bold'
+          }}
+          title="Remove from cart"
+        >
+          ×
+        </button>
       </div>
     ))}
+
     <hr style={{margin: '15px 0', border: '0', borderTop: '1px solid #eee'}} />
+
     <div style={{display: 'flex', justifyContent: 'space-between', fontWeight: 'bold', marginBottom: '15px'}}>
       <span>Total:</span>
-      <span>₹{cart.reduce((sum, item) => sum + (item.price * item.quantity), 0)}</span>
+      <span>₹{cart.reduce((sum, item) => sum + item.price * (item.quantity || 1), 0)}</span>
     </div>
+
     <button 
       onClick={handleMedicineCheckout}
       style={{
@@ -440,6 +525,8 @@ const Card = ({ children }) => (
   </div>
 )}
 
+
+{/* Accepted Bookings */}
 {myBookings.length > 0 && (
   myBookings
     .filter(booking => booking.status === 'accepted')
